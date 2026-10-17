@@ -1,0 +1,10 @@
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Target = opencode-desktop-bin
+
+[Action]
+Description = Reaplica o patch de title bar do OpenCode Desktop no Linux
+When = PostTransaction
+Exec = /usr/bin/python3 /home/emanuel/.local/bin/opencode-desktop-titlebar-patch
