@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""Faz o OpenCode Desktop se comportar no Linux como no Windows.
+
+O pacote AUR entrega a janela com moldura nativa no Linux porque o
+`BrowserWindow` do app so aplica `frame:!1` na plataforma `win32`. O GNOME
+desenha a barra de titulo e o app desenha a sua logo abaixo: duas barras. No
+Windows o ramo do `win32` remove a moldura e liga o `titleBarOverlay`,
+deixando a barra do app como unica linha.
+
+Dois ajustes sao necessarios:
+
+1. main process: sem moldura + overlay, para a barra nativa sumir.
+2. renderer: a area reservada aos controles da janela (`env(titlebar-area-
+   width)`) so e aplicada quando o app acha que a plataforma e `windows`.
+   Sem isso o botao "+" de nova sessao fica embaixo do botao de fechar.
+
+Os dois trocam um teste de plataforma por um de MESMO TAMANHO em bytes, entao
+alteram poucos bytes do arquivo e nada mais: sem rebuild do asar, sem deslocar
+offset, sem risco as outras entradas. `win32` e `linux` compartilham a letra
+'i' no indice 1 e `darwin` nao tem, entao a checagem de caracteres reproduz o
+mesmo efeito do original. Se o bundle mudar no upstream e o trecho nao for
+mais encontrado, o script aborta sem tocar em nada.
+
+Um terceiro ajuste (symbolColor do overlay) foi tentado e REMOVIDO: com
+`symbolColor` explicito (`white`/`black` do tema da criacao), o Chromium
+congela a cor no momento do apply; `void 0` (undefined) cai no default, que
+no GNOME e branco (cor de sistema, segue o tema do SO e nao o tema interno
+do app) — no tema claro o X branco "some". Como a troca de tema e interna
+do app (matchMedia do renderer, sem canal IPC de tema no bundle), nenhum
+valor estatico acompanha os dois temas. Decisao do usuario: manter o
+comportamento de fabrica (cor congelada no tema da abertura).
+"""
+import fnmatch
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+USER_HOME = Path(os.environ.get("OPENCODE_PATCH_HOME") or "/home/emanuel")
+STATE_DIR = USER_HOME / ".local" / "state" / "opencode-desktop-titlebar"
+ENTRY = "out/main/index.js"
+RENDERER = "out/renderer/assets/main-*.js"
+
+PATCHES = [
+    (
+        "titlebar: janela sem moldura",
+        ENTRY,
+        b"process.platform===`win32`?{frame:!1",
+        b"process.platform[1] ===`i`?{frame:!1",
+    ),
+    # A largura da area reservada NAO e ajustada de proposito: o Chromium ja
+    # devolve env(titlebar-area-width) medindo apenas os botoes que ele
+    # realmente desenha. Fixar um valor em px piorou o resultado e quebraria
+    # ao trocar a escala.
+    # Bundle de 2026-10: a variavel do renderer foi renomeada de `d=` para
+    # `f=` (upstream minify). A troca segue de tamanho fixo: `===`windows``
+    # (12B) -> `[1] ===`i`  ` (12B), o mesmo truque de byte-count do original.
+    (
+        "titlebar: area reservada aos controles",
+        RENDERER,
+        b"f=E(()=>t.platform===`desktop`&&t.os===`windows`)",
+        b"f=E(()=>t.platform===`desktop`&&t.os[1] ===`i`  )",
+    ),
+    # O patch do symbolColor foi REMOVIDO a pedido do usuario (volta ao
+    # comportamento de fabrica: cor congelada no tema da abertura). Nao
+    # reintroduzir sem aprovacao: `void 0` cai no branco de sistema e some
+    # no tema claro; espacos puros quebram o parser ESM do bundle.
+]
+for label, _, old, new in PATCHES:
+    assert len(old) == len(new), f"{label}: troca precisa preservar o tamanho ({len(old)} != {len(new)})"
+
+
+def find_asar():
+    # Override para validar em copia scratch sem tocar no pacote instalado.
+    override = os.environ.get("OPENCODE_ASAR_OVERRIDE")
+    if override and Path(override).exists():
+        return Path(override)
+
+    # rpm primeiro (Fedora aqui não tem hook de pacman), pacman depois
+    # (portabilidade dev). Cada gerenciador usa nomes diferentes para o
+    # mesmo app, então a varredura cobre os dois.
+    for tool, packages in (
+        (["rpm", "-ql"], ["opencode-desktop", "opencode"]),
+        (["pacman", "-Ql"], ["opencode-desktop-bin"]),
+    ):
+        for package in packages:
+            try:
+                out = subprocess.run(
+                    tool + [package], capture_output=True, text=True, check=False
+                ).stdout
+            except Exception:
+                continue
+            for line in out.splitlines():
+                # pacman imprime "pacote caminho"; rpm imprime só "caminho".
+                # split()[-1] cobre os dois formatos (caminhos de asar não
+                # têm espaço).
+                path = line.strip().split()[-1] if line.strip() else ""
+                if path.endswith("/app.asar") and Path(path).exists():
+                    return Path(path)
+
+    # Fallback para layouts de instalação comuns fora do gerenciador de pacotes.
+    for candidate in (
+        "/usr/lib/opencode-desktop/app.asar",
+        "/usr/lib/opencode-desktop/resources/app.asar",
+        "/opt/opencode-desktop/app.asar",
+    ):
+        fallback = Path(candidate)
+        if fallback.exists():
+            return fallback
+    return None
+
+
+def load(asar):
+    """Le o header e devolve (data_start, [(caminho, entrada)])."""
+    with open(asar, "rb") as fh:
+        prefix = fh.read(16)
+        payload_size = struct.unpack("<I", prefix[4:8])[0]
+        json_len = struct.unpack("<I", prefix[12:16])[0]
+        header = json.loads(fh.read(json_len))
+        flat, stack = [], [(header, "")]
+        while stack:
+            node, path = stack.pop()
+            for name, entry in node.get("files", {}).items():
+                sub = f"{path}/{name}"
+                if "files" in entry:
+                    stack.append((entry, sub))
+                else:
+                    flat.append((sub.lstrip("/"), entry))
+        return 16 + payload_size, flat
+
+
+def resolve(flat, pattern):
+    hits = [e for path, e in flat if fnmatch.fnmatch(path, pattern)]
+    if len(hits) != 1:
+        raise SystemExit(f"padrao {pattern} casou com {len(hits)} entradas, esperado 1")
+    return hits[0]
+
+
+def read(asar, data_start, entry):
+    with open(asar, "rb") as fh:
+        fh.seek(data_start + int(entry["offset"]))
+        return fh.read(entry["size"])
+
+
+def write(asar, position, index, payload):
+    with open(asar, "r+b") as fh:
+        fh.seek(position + index)
+        fh.write(payload)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def swap(asar, position, data, old, new):
+    """Inverte o trecho: se data tem old grava new, e vice-versa."""
+    if old in data:
+        write(asar, position, data.index(old), new)
+    else:
+        write(asar, position, data.index(new), old)
+
+
+def verify_main_syntax(asar, data_start, flat):
+    """Pos-condicao: o trecho do titleBarOverlay ainda parseia como JS puro.
+
+    Os nomes minificados mudam a cada build upstream (Xe -> A9 -> ...), então
+    as ancoras agora sao dinamicas: descobre o identificador a partir de
+    `titleBarOverlay:NAME(` no ponto do patch, extrai de `function NAME(`
+    ate o primeiro `}}var` (delimitador minificado padrao do fim da funcao)
+    que segue o USO do overlay, e roda `node --check` no recorte puro, sem
+    imports. Se o recorte truncacao chegar a quebrar o parse, tenta os
+    proximos delimitadores; falhar em todos aborta sem validar — o patch e
+    tratado como nao confiavel e o script sai com erro (nunca instala a
+    mao).
+    """
+    try:
+        entry = resolve(flat, ENTRY)
+    except SystemExit as exc:
+        print(f"  [pos] sintaxe: {exc}")
+        return False
+    data = read(asar, data_start, entry)
+    # aceita as duas vidas do patch: aplicado ou original
+    patched = b"process.platform[1] ===`i`?{frame:!1"
+    original = b"process.platform===`win32`?{frame:!1"
+    use_idx = data.find(patched)
+    if use_idx < 0:
+        use_idx = data.find(original)
+    if use_idx < 0:
+        print("  [pos] sintaxe: patch principal ausente no bundle - NAO validado")
+        return False
+    # descobre o nome atual do overlay a partir do uso, logo a frente
+    marker = b"titleBarOverlay:"
+    marker_idx = data.find(marker, use_idx)
+    if marker_idx < 0 or marker_idx - use_idx > 300:
+        print("  [pos] sintaxe: uso do overlay fora do recorte do patch - NAO validado")
+        return False
+    allowed = set(
+        map(ord, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$")
+    )
+    name_start = marker_idx + len(marker)
+    name_end = name_start
+    while name_end < len(data) and data[name_end] in allowed:
+        name_end += 1
+    name = data[name_start:name_end]
+    start = data.rfind(b"function " + name + b"(", 0, use_idx)
+    if start < 0:
+        print(
+            f"  [pos] sintaxe: definicao de {name.decode('utf-8', 'replace')} "
+            "nao encontrada - NAO validado"
+        )
+        return False
+    # recortes candidatos: 1o === fim real da funcao; proximos = tolerancia
+    # caso o bundler troque `var` por const/let no futuro
+    snippets = []
+    scan = start
+    for _ in range(4):
+        scan = data.find(b"}}var", scan)
+        if scan < 0 or scan <= start:
+            break
+        snippets.append(data[start:scan + 2])  # inclui o fechamento }} da funcao
+        scan += 1
+    if not snippets:
+        print("  [pos] sintaxe: delimitador }}var ausente (bundle mudou?) - NAO validado")
+        return False
+    node = shutil.which("node") or "/usr/bin/node"
+    if not Path(node).exists():
+        print(f"  [pos] sintaxe: node nao encontrado ({node}) - NAO validado")
+        return False
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        result = None
+        for k, snippet in enumerate(snippets, 1):
+            tmp = tmp_dir / f"overlay{k}.mjs"
+            tmp.write_bytes(snippet)
+            result = subprocess.run([node, "--check", str(tmp)], capture_output=True)
+            tmp.unlink()
+            if result.returncode == 0:
+                print("  [pos] sintaxe do overlay: OK")
+                return True
+        if result is not None:
+            print("  [pos] sintaxe do overlay: FALHOU (parse) - patch NAO confiavel")
+            for line in result.stderr.decode("utf-8", "replace").splitlines()[-4:]:
+                print(f"        {line}")
+        return False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "apply"
+    if mode not in ("apply", "--check", "--revert"):
+        print(f"uso: {sys.argv[0]} [--check|--revert]", file=sys.stderr)
+        return 2
+
+    asar = find_asar()
+    if not asar:
+        print("ERRO: app.asar nao encontrado", file=sys.stderr)
+        return 1
+    print(f"asar: {asar}")
+    data_start, flat = load(asar)
+    before = asar.stat().st_size
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    states, failures = {}, 0
+    for n, (label, pattern, old, new) in enumerate(PATCHES, 1):
+        try:
+            entry = resolve(flat, pattern)
+        except SystemExit as exc:
+            print(f"  [{n}] {label}: {exc}")
+            failures += 1
+            continue
+        base = data_start + int(entry["offset"])
+        data = read(asar, data_start, entry)
+        state = "patched" if new in data else "unpatched" if old in data else "unknown"
+        states[label] = state
+
+        if state == "unknown":
+            print(f"  [{n}] {label}: TRECHO NAO ENCONTRADO (bundle mudou) - nada alterado")
+            failures += 1
+            continue
+        if (mode == "apply" and state == "patched") or (mode == "--revert" and state == "unpatched"):
+            print(f"  [{n}] {label}: {state} (nada a fazer)")
+            continue
+        if mode == "--check":
+            print(f"  [{n}] {label}: {state}")
+            continue
+
+        backup = STATE_DIR / f"snippet{n}.orig"
+        if not backup.exists():
+            backup.write_bytes(old if state == "unpatched" else new)
+        write(asar, base, data.index(old) if state == "unpatched" else data.index(new),
+              new if state == "unpatched" else old)
+        after = read(asar, data_start, entry)
+        new_state = "patched" if new in after else "unpatched" if old in after else "unknown"
+        if new_state == state:
+            swap(asar, base, after, old, new)
+            print(f"  [{n}] {label}: ERRO na escrita, revertido")
+            failures += 1
+            continue
+        states[label] = new_state
+        print(f"  [{n}] {label}: {state} -> {new_state}")
+
+    print(f"tamanho do asar: {before} -> {asar.stat().st_size} ({asar.stat().st_size - before:+d})")
+    if failures == 0 and mode != "--check":
+        # Pos-condicao de sintaxe: so declara sucesso se o bundle do main
+        # ainda parseia. Evita repetir o caso do simbolo corrompido.
+        if not verify_main_syntax(asar, data_start, flat):
+            failures += 1
+    if failures:
+        return 2
+    if mode == "--check":
+        return 0 if all(s == "patched" for s in states.values()) else 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
