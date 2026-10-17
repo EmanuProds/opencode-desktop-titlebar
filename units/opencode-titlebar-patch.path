@@ -1,0 +1,10 @@
+[Unit]
+Description=Dispara o patch quando o app.asar do OpenCode Desktop muda (ex.: dnf upgrade)
+
+[Path]
+# Flatpak não tem caminho estável; rpm instala em /usr/lib/opencode-desktop.
+PathChanged=/usr/lib/opencode-desktop/resources/app.asar
+Unit=opencode-titlebar-patch.service
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Reaplica o patch de title bar do OpenCode Desktop
+Documentation=opencode-desktop-titlebar-patch neste repositorio
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/opencode-desktop-titlebar-patch
+# o patch é idempotente (--check embutido) e não deve sinalizar erro
+# no boot quando ainda não há pacote instalado
+RemainAfterExit=no
+
+[Install]
+WantedBy=default.target
